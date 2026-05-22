@@ -279,6 +279,8 @@ let state = {
   uploadResult: null,
   error: null,
   repoFiles: [],
+  manifest: {},
+  manifestSha: null,
   loadingFiles: false,
   dragOver: false,
   copiedUrl: null,
@@ -310,6 +312,27 @@ function generateRandomName(length = 8) {
   return result + '.pdf';
 }
 
+function getManifestEntry(manifest, path, basename) {
+  const raw = manifest[path] ?? manifest[basename];
+  if (!raw) return null;
+  if (typeof raw === 'string') return { name: raw, uploadedAt: null };
+  return raw;
+}
+
+function fileSortKey(f, manifest) {
+  const entry = getManifestEntry(manifest, f.path, f.name);
+  if (entry && entry.uploadedAt) return entry.uploadedAt;
+  const dir = f.path.includes('/') ? f.path.split('/')[0] : '';
+  return dir;
+}
+
+function generateRandomPath() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  return `${yyyy}-${mm}/${generateRandomName()}`;
+}
+
 async function copyUrl(url) {
   try {
     await navigator.clipboard.writeText(url);
@@ -325,19 +348,71 @@ async function copyUrl(url) {
   setTimeout(() => setState({ copiedUrl: null }), 2000);
 }
 
+async function fetchManifest() {
+  const { token, username, repo } = state.config;
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${username}/${repo}/contents/manifest.json`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const decoded = decodeURIComponent(escape(atob(data.content.replace(/\n/g, ''))));
+      return { manifest: JSON.parse(decoded), sha: data.sha };
+    }
+  } catch(e) {}
+  return { manifest: {}, sha: null };
+}
+
+async function saveManifest(manifest, sha) {
+  const { token, username, repo } = state.config;
+  const json = JSON.stringify(manifest, null, 2);
+  const base64 = btoa(unescape(encodeURIComponent(json)));
+  const body = { message: 'Update manifest.json', content: base64 };
+  if (sha) body.sha = sha;
+  const res = await fetch(
+    `https://api.github.com/repos/${username}/${repo}/contents/manifest.json`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }
+  );
+  if (res.ok) {
+    const data = await res.json();
+    return data.content.sha;
+  }
+  return null;
+}
+
 async function fetchRepoFiles() {
   const { token, username, repo } = state.config;
   if (!token || !username || !repo) return;
   setState({ loadingFiles: true });
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${username}/${repo}/contents/`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      const pdfs = data.filter(f => f.name.toLowerCase().endsWith('.pdf'));
-      setState({ repoFiles: pdfs, loadingFiles: false });
+    const [treeRes, manifestData] = await Promise.all([
+      fetch(`https://api.github.com/repos/${username}/${repo}/git/trees/main?recursive=1`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }),
+      fetchManifest()
+    ]);
+    if (treeRes.ok) {
+      const data = await treeRes.json();
+      const pdfs = (data.tree || [])
+        .filter(t => t.type === 'blob' && t.path.toLowerCase().endsWith('.pdf'))
+        .map(t => ({ path: t.path, name: t.path.split('/').pop(), sha: t.sha, size: t.size }))
+        .sort((a, b) => {
+          const ka = fileSortKey(a, manifestData.manifest);
+          const kb = fileSortKey(b, manifestData.manifest);
+          if (kb !== ka) return kb > ka ? 1 : -1;
+          return b.path.localeCompare(a.path);
+        });
+      setState({
+        repoFiles: pdfs,
+        manifest: manifestData.manifest,
+        manifestSha: manifestData.sha,
+        loadingFiles: false
+      });
     } else {
       setState({ repoFiles: [], loadingFiles: false });
     }
@@ -425,7 +500,7 @@ async function uploadFiles() {
 
   for (let i = 0; i < state.files.length; i++) {
     const file = state.files[i];
-    const randomName = generateRandomName();
+    const randomPath = generateRandomName();
     setState({ uploadProgress: { current: i + 1, total: state.files.length } });
 
     try {
@@ -439,7 +514,7 @@ async function uploadFiles() {
       let sha;
       try {
         const existCheck = await fetch(
-          `https://api.github.com/repos/${username}/${repo}/contents/${randomName}`,
+          `https://api.github.com/repos/${username}/${repo}/contents/${randomPath}`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
         if (existCheck.ok) {
@@ -448,11 +523,11 @@ async function uploadFiles() {
         }
       } catch(e) {}
 
-      const body = { message: `Upload ${randomName} (${file.name})`, content: base64 };
+      const body = { message: `Upload ${randomPath} (${file.name})`, content: base64 };
       if (sha) body.sha = sha;
 
       const res = await fetch(
-        `https://api.github.com/repos/${username}/${repo}/contents/${randomName}`,
+        `https://api.github.com/repos/${username}/${repo}/contents/${randomPath}`,
         {
           method: 'PUT',
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -461,7 +536,7 @@ async function uploadFiles() {
       );
 
       if (res.ok) {
-        results.push({ name: file.name, uploadedName: randomName, url: `${getBaseUrl()}/${randomName}`, success: true });
+        results.push({ name: file.name, uploadedName: randomPath, url: `${getBaseUrl()}/${randomPath}`, success: true });
       } else {
         const errData = await res.json();
         results.push({ name: file.name, error: errData.message, success: false });
@@ -471,22 +546,42 @@ async function uploadFiles() {
     }
   }
 
+  const successResults = results.filter(r => r.success);
+  if (successResults.length > 0) {
+    const { manifest, sha } = await fetchManifest();
+    const updated = { ...manifest };
+    const uploadedAt = new Date().toISOString();
+    successResults.forEach(r => {
+      updated[r.uploadedName] = { name: r.name, uploadedAt };
+    });
+    await saveManifest(updated, sha);
+  }
+
   setState({ uploadResult: results, files: [], uploading: false });
   fetchRepoFiles();
 }
 
-async function deleteFile(fileName, sha) {
-  if (!confirm(`「${fileName}」を削除しますか？`)) return;
+async function deleteFile(filePath, sha) {
+  const basename = filePath.split('/').pop();
+  const entry = getManifestEntry(state.manifest, filePath, basename);
+  const originalName = entry ? entry.name : null;
+  const displayName = originalName ? `${originalName} (${filePath})` : filePath;
+  if (!confirm(`「${displayName}」を削除しますか？`)) return;
   const { token, username, repo } = state.config;
   try {
     await fetch(
-      `https://api.github.com/repos/${username}/${repo}/contents/${fileName}`,
+      `https://api.github.com/repos/${username}/${repo}/contents/${filePath}`,
       {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: `Delete ${fileName}`, sha })
+        body: JSON.stringify({ message: `Delete ${filePath}`, sha })
       }
     );
+    const { manifest, sha: manifestSha } = await fetchManifest();
+    if (manifest[filePath]) {
+      delete manifest[filePath];
+      await saveManifest(manifest, manifestSha);
+    }
     fetchRepoFiles();
   } catch(e) {
     setState({ error: '削除に失敗しました。' });
@@ -635,15 +730,18 @@ function renderMain() {
     repoFilesHtml = `<div class="empty">${loadingFiles ? '読み込み中...' : 'PDFファイルがありません'}</div>`;
   } else {
     repoFiles.forEach(f => {
-      const url = `${baseUrl}/${f.name}`;
+      const url = `${baseUrl}/${f.path}`;
+      const entry = getManifestEntry(state.manifest, f.path, f.name);
+      const originalName = entry ? entry.name : null;
       repoFilesHtml += `
         <div class="file-row">
           <div style="flex:1; min-width:0;">
             <div class="file-info" style="margin-bottom:6px">
               <span class="file-badge file-badge-pdf">PDF</span>
-              <span class="file-name">${f.name}</span>
+              <span class="file-name">${originalName ? originalName : f.name}</span>
               <span class="file-size">${formatSize(f.size)}</span>
             </div>
+            <div style="font-size:10px; color:var(--text-muted); font-family:'JetBrains Mono', monospace; margin-bottom:4px; padding-left:42px;">${f.path}</div>
             <div class="url-row">
               <input class="url-input" type="text" value="${url}" readonly onclick="this.select()">
               <button class="btn btn-copy ${copiedUrl === url ? 'copied' : ''}" data-copy="${url}">
@@ -651,7 +749,7 @@ function renderMain() {
               </button>
             </div>
           </div>
-          <button class="btn-icon" data-delete="${f.name}" data-sha="${f.sha}" style="margin-left:8px" title="削除">🗑</button>
+          <button class="btn-icon" data-delete="${f.path}" data-sha="${f.sha}" style="margin-left:8px" title="削除">🗑</button>
         </div>
       `;
     });
